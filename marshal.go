@@ -186,20 +186,32 @@ func (s Slice) MarshalBinary() ([]byte, error) {
 // UnmarshalBinary implements encoding.BinaryUnmarshaler.
 // It accepts all known binary encodings for the data - all the
 // embedded macaroons need not be encoded in the same format.
+//
+// The slice is updated atomically: it is replaced only when the
+// whole data has been parsed successfully. If an error is
+// returned, the slice is left unchanged, so a partially written
+// or truncated buffer (for example one produced by an
+// interrupted write) cannot silently replace a complete set of
+// macaroons with only the prefix that happened to parse, and a
+// later retry with the complete data will restore the full set.
 func (s *Slice) UnmarshalBinary(data []byte) error {
 	// Prevent the internal data structures from holding onto the
 	// slice by copying it first.
 	data = append([]byte(nil), data...)
-	*s = (*s)[:0]
+	// Parse into a fresh slice rather than updating s in place,
+	// so that a failure part-way through the data leaves the
+	// original slice untouched.
+	var macs Slice
 	for len(data) > 0 {
 		var m Macaroon
 		rest, err := m.parseBinary(data)
 		if err != nil {
 			return fmt.Errorf("cannot unmarshal macaroon: %v", err)
 		}
-		*s = append(*s, &m)
+		macs = append(macs, &m)
 		data = rest
 	}
+	*s = macs
 	return nil
 }
 

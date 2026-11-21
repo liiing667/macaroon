@@ -196,6 +196,149 @@ func testSliceRoundTripWithVersion(c *qt.C, vers macaroon.Version) {
 	c.Assert(b, qt.DeepEquals, marshaledMacs)
 }
 
+func TestSliceRoundTripSingleMacaroonV1(t *testing.T) {
+	c := qt.New(t)
+	testSliceRoundTripSingleMacaroonWithVersion(c, macaroon.V1)
+}
+
+func TestSliceRoundTripSingleMacaroonV2(t *testing.T) {
+	c := qt.New(t)
+	testSliceRoundTripSingleMacaroonWithVersion(c, macaroon.V2)
+}
+
+func testSliceRoundTripSingleMacaroonWithVersion(c *qt.C, vers macaroon.Version) {
+	m := MustNew([]byte("secret"), []byte("some id"), "a location", vers)
+	err := m.AddFirstPartyCaveat([]byte("a caveat"))
+	c.Assert(err, qt.Equals, nil)
+
+	macaroons := macaroon.Slice{m}
+	data, err := macaroons.MarshalBinary()
+	c.Assert(err, qt.Equals, nil)
+
+	var unmarshaledMacs macaroon.Slice
+	err = unmarshaledMacs.UnmarshalBinary(data)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(unmarshaledMacs, qt.HasLen, 1)
+	c.Assert(string(unmarshaledMacs[0].Id()), qt.Equals, "some id")
+	c.Assert(unmarshaledMacs[0].Version(), qt.Equals, vers)
+
+	remarshaled, err := unmarshaledMacs.MarshalBinary()
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(remarshaled, qt.DeepEquals, data)
+}
+
+func TestSliceRoundTripEmpty(t *testing.T) {
+	c := qt.New(t)
+	var macaroons macaroon.Slice
+	data, err := macaroons.MarshalBinary()
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(data, qt.HasLen, 0)
+
+	var unmarshaledMacs macaroon.Slice
+	err = unmarshaledMacs.UnmarshalBinary(data)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(unmarshaledMacs, qt.HasLen, 0)
+
+	// Unmarshaling empty data into a previously populated
+	// slice leaves it empty.
+	unmarshaledMacs = macaroon.Slice{
+		MustNew([]byte("secret"), []byte("some id"), "a location", macaroon.V2),
+	}
+	err = unmarshaledMacs.UnmarshalBinary(nil)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(unmarshaledMacs, qt.HasLen, 0)
+}
+
+func TestSliceRoundTripMixedVersions(t *testing.T) {
+	c := qt.New(t)
+	m1 := MustNew([]byte("secret"), []byte("v1 id"), "v1 location", macaroon.V1)
+	m2 := MustNew([]byte("secret"), []byte("v2 id"), "v2 location", macaroon.V2)
+
+	macaroons := macaroon.Slice{m1, m2}
+	data, err := macaroons.MarshalBinary()
+	c.Assert(err, qt.Equals, nil)
+
+	var unmarshaledMacs macaroon.Slice
+	err = unmarshaledMacs.UnmarshalBinary(data)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(unmarshaledMacs, qt.HasLen, 2)
+	c.Assert(unmarshaledMacs[0].Version(), qt.Equals, macaroon.V1)
+	c.Assert(unmarshaledMacs[1].Version(), qt.Equals, macaroon.V2)
+
+	remarshaled, err := unmarshaledMacs.MarshalBinary()
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(remarshaled, qt.DeepEquals, data)
+}
+
+func TestSliceUnmarshalBinaryFailurePreservesSliceV1(t *testing.T) {
+	c := qt.New(t)
+	testSliceUnmarshalBinaryFailurePreservesSlice(c, macaroon.V1)
+}
+
+func TestSliceUnmarshalBinaryFailurePreservesSliceV2(t *testing.T) {
+	c := qt.New(t)
+	testSliceUnmarshalBinaryFailurePreservesSlice(c, macaroon.V2)
+}
+
+// testSliceUnmarshalBinaryFailurePreservesSlice checks that when
+// Slice.UnmarshalBinary fails part-way through a multi-macaroon
+// buffer (for example because the buffer was truncated by an
+// interrupted write), the receiving slice is left unchanged, so
+// that the complete set of macaroons survives the partial
+// failure and a later retry with the complete data.
+func testSliceUnmarshalBinaryFailurePreservesSlice(c *qt.C, vers macaroon.Version) {
+	rootKey := []byte("secret")
+	m1 := MustNew(rootKey, []byte("some id"), "a location", vers)
+	err := m1.AddFirstPartyCaveat([]byte("a caveat"))
+	c.Assert(err, qt.Equals, nil)
+	m2 := MustNew(rootKey, []byte("some other id"), "another location", vers)
+	err = m2.AddThirdPartyCaveat([]byte("shared root key"), []byte("3rd party caveat"), "remote.com")
+	c.Assert(err, qt.Equals, nil)
+
+	macaroons := macaroon.Slice{m1, m2}
+	data, err := macaroons.MarshalBinary()
+	c.Assert(err, qt.Equals, nil)
+
+	var s macaroon.Slice
+	err = s.UnmarshalBinary(data)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(s, qt.HasLen, len(macaroons))
+
+	// Truncate the data part-way through the second macaroon,
+	// simulating a partially written buffer.
+	badData := data[:len(data)-10]
+
+	err = s.UnmarshalBinary(badData)
+	c.Assert(err, qt.ErrorMatches, `cannot unmarshal macaroon: .*`)
+
+	// The failed unmarshal must not have destroyed the
+	// previously unmarshaled slice: the complete set of
+	// macaroons is still there.
+	c.Assert(s, qt.HasLen, len(macaroons))
+	for i, m := range macaroons {
+		c.Assert(string(s[i].Id()), qt.Equals, string(m.Id()))
+		c.Assert(s[i].Signature(), qt.DeepEquals, m.Signature())
+		c.Assert(s[i].Caveats(), qt.DeepEquals, m.Caveats())
+		c.Assert(s[i].Version(), qt.Equals, vers)
+	}
+
+	// Re-marshaling after the failure still produces the
+	// complete original data, not just the parsable prefix.
+	remarshaled, err := s.MarshalBinary()
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(remarshaled, qt.DeepEquals, data)
+
+	// A retry with the complete data succeeds and restores
+	// the full set.
+	err = s.UnmarshalBinary(data)
+	c.Assert(err, qt.Equals, nil)
+	c.Assert(s, qt.HasLen, len(macaroons))
+	for i, m := range macaroons {
+		c.Assert(string(s[i].Id()), qt.Equals, string(m.Id()))
+		c.Assert(s[i].Signature(), qt.DeepEquals, m.Signature())
+	}
+}
+
 var base64DecodeTests = []struct {
 	about       string
 	input       string
