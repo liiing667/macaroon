@@ -313,12 +313,12 @@ func (vctx *verificationContext) verify(root *Macaroon, rootKey []byte) error {
 	vctx.trace(0, TraceMakeKey, rootKey, nil)
 	derivedKey := makeKey(rootKey)
 	if err := vctx.verify0(root, 0, derivedKey); err != nil {
-		vctx.trace(0, TraceFail, nil, nil)
+		vctx.markFailed()
 		return err
 	}
 	for i, wasUsed := range vctx.used {
 		if !wasUsed {
-			vctx.trace(i+1, TraceFail, nil, nil)
+			vctx.markFailed()
 			return fmt.Errorf("discharge macaroon %q was not used", vctx.discharges[i].Id())
 		}
 	}
@@ -340,7 +340,6 @@ func (vctx *verificationContext) verify0(m *Macaroon, index int, rootKey *[hashL
 			}
 			vctx.traceRootKey(di+1, cavKey[:])
 			if err := vctx.verify0(dm, di+1, cavKey); err != nil {
-				vctx.trace(di+1, TraceFail, nil, nil)
 				return err
 			}
 			vctx.trace(index, TraceHash, cav.VerificationId, cav.Id)
@@ -389,6 +388,28 @@ func (vctx *verificationContext) trace(index int, op TraceOpKind, data1, data2 [
 			Data1: data1,
 			Data2: data2,
 		})
+	}
+}
+
+// markFailed records a verification failure on every trace that took part
+// in the verification so far. A trace that has been marked failed is not
+// touched again, which makes the operation idempotent when a failure
+// unwinds through several nested discharge verifications.
+//
+// Without this, a trace belonging to a macaroon whose verification did not
+// complete could still contain an apparently successful chain of operations
+// (or no operations at all), leading a consumer of the trace to treat a
+// failed operation as evidence that verification succeeded.
+func (vctx *verificationContext) markFailed() {
+	if vctx.traces == nil {
+		return
+	}
+	for i := range vctx.traces {
+		ops := vctx.traces[i].Ops
+		if len(ops) > 0 && ops[len(ops)-1].Kind == TraceFail {
+			continue
+		}
+		vctx.traces[i].Ops = append(ops, TraceOp{Kind: TraceFail})
 	}
 }
 

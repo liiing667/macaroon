@@ -17,6 +17,11 @@ type Trace struct {
 // returned slice.
 // When a trace has resulted in a failure, the
 // last element will be nil.
+// A trace produced by a failed verification always ends with a TraceFail
+// operation, so callers can distinguish a failed trace from a successful
+// one by checking that the last operation kind is TraceFail; they must
+// never treat the operations recorded before the failure as evidence that
+// verification succeeded.
 func (t Trace) Results() [][]byte {
 	r := make([][]byte, len(t.Ops))
 	input := t.RootKey
