@@ -376,6 +376,58 @@ var verifyTests = []struct {
 		expectErr: `discharge macaroon "bob-is-great" was not used`,
 	}},
 }, {
+	about: "two third party caveats with same id and two discharges",
+	macaroons: []macaroonSpec{{
+		rootKey: "root-key",
+		id:      "root-id",
+		caveats: []caveat{{
+			condition: "wonderful",
+		}, {
+			condition: "bob-is-great",
+			location:  "bob",
+			rootKey:   "bob-caveat-root-key",
+		}, {
+			condition: "bob-is-great",
+			location:  "bob",
+			rootKey:   "bob-caveat-root-key",
+		}},
+	}, {
+		location: "bob",
+		rootKey:  "bob-caveat-root-key",
+		id:       "bob-is-great",
+		caveats: []caveat{{
+			condition: "splendid",
+		}},
+	}, {
+		location: "bob",
+		rootKey:  "bob-caveat-root-key",
+		id:       "bob-is-great",
+		caveats: []caveat{{
+			condition: "top of the world",
+		}},
+	}},
+	conditions: []conditionTest{{
+		conditions: map[string]bool{
+			"wonderful":        true,
+			"splendid":         true,
+			"top of the world": true,
+		},
+	}, {
+		conditions: map[string]bool{
+			"wonderful":        true,
+			"splendid":         false,
+			"top of the world": true,
+		},
+		expectErr: `condition "splendid" not met`,
+	}, {
+		conditions: map[string]bool{
+			"wonderful":        true,
+			"splendid":         true,
+			"top of the world": false,
+		},
+		expectErr: `condition "top of the world" not met`,
+	}},
+}, {
 	about: "one discharge used for two macaroons",
 	macaroons: []macaroonSpec{{
 		rootKey: "root-key",
@@ -638,6 +690,64 @@ func TestVerify(t *testing.T) {
 			}
 		}
 	}
+}
+
+func TestVerifySameIdDischargeSelectionStable(t *testing.T) {
+	c := qt.New(t)
+	rootKey, macaroons := makeMacaroons([]macaroonSpec{{
+		rootKey: "root-key",
+		id:      "root-id",
+		caveats: []caveat{{
+			condition: "bob-is-great",
+			location:  "bob",
+			rootKey:   "bob-caveat-root-key",
+		}, {
+			condition: "bob-is-great",
+			location:  "bob",
+			rootKey:   "bob-caveat-root-key",
+		}},
+	}, {
+		location: "bob",
+		rootKey:  "bob-caveat-root-key",
+		id:       "bob-is-great",
+		caveats: []caveat{{
+			condition: "splendid",
+		}},
+	}, {
+		location: "bob",
+		rootKey:  "bob-caveat-root-key",
+		id:       "bob-is-great",
+		caveats: []caveat{{
+			condition: "top of the world",
+		}},
+	}})
+	check := func(string) error { return nil }
+
+	// Both discharges must be selected, each exactly once.
+	traces, err := macaroons[0].TraceVerify(rootKey, macaroons[1:])
+	c.Assert(err, qt.IsNil)
+	c.Assert(traces, qt.HasLen, 3)
+	c.Assert(len(traces[1].Ops) > 0, qt.Equals, true)
+	c.Assert(len(traces[2].Ops) > 0, qt.Equals, true)
+
+	// Concurrent verifications must all agree on the same branch.
+	const n = 10
+	errc := make(chan error, n)
+	for i := 0; i < n; i++ {
+		go func() {
+			errc <- macaroons[0].Verify(rootKey, check, macaroons[1:])
+		}()
+	}
+	for i := 0; i < n; i++ {
+		c.Assert(<-errc, qt.IsNil)
+	}
+
+	// A retried verification must select the same discharges and
+	// produce the same result as the first attempt.
+	retryTraces, err := macaroons[0].TraceVerify(rootKey, macaroons[1:])
+	c.Assert(err, qt.IsNil)
+	c.Assert(retryTraces, qt.DeepEquals, traces)
+	c.Assert(macaroons[0].Verify(rootKey, check, macaroons[1:]), qt.IsNil)
 }
 
 func TestTraceVerify(t *testing.T) {

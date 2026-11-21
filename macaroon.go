@@ -366,18 +366,34 @@ func (vctx *verificationContext) verify0(m *Macaroon, index int, rootKey *[hashL
 }
 
 func (vctx *verificationContext) findDischarge(id []byte) (dm *Macaroon, index int, err error) {
+	foundUsed := false
 	for di, dm := range vctx.discharges {
 		if !bytes.Equal(dm.id, id) {
+			continue
+		}
+		if vctx.used[di] {
+			// This discharge macaroon has already been used,
+			// but there may be another discharge macaroon with
+			// the same id that has not been used yet, so keep
+			// looking rather than failing immediately. This
+			// keeps the choice of discharge deterministic when
+			// several discharge macaroons share the same id
+			// (for example when a discharge is re-fetched after
+			// a retry): each caveat is paired with the first
+			// not-yet-used matching discharge, so the selected
+			// discharge is always the one that the final
+			// authorization decision depends on.
+			foundUsed = true
 			continue
 		}
 		// Don't use a discharge macaroon more than once.
 		// It's important that we do this check here rather than after
 		// verify as it prevents potentially infinite recursion.
-		if vctx.used[di] {
-			return nil, 0, fmt.Errorf("discharge macaroon %q was used more than once", dm.Id())
-		}
 		vctx.used[di] = true
 		return dm, di, nil
+	}
+	if foundUsed {
+		return nil, 0, fmt.Errorf("discharge macaroon %q was used more than once", id)
 	}
 	return nil, 0, fmt.Errorf("cannot find discharge macaroon for caveat %x", id)
 }
