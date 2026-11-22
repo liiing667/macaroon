@@ -57,7 +57,12 @@ func (m *Macaroon) MarshalJSON() ([]byte, error) {
 //
 // After unmarshaling, the macaroon's version will reflect
 // the version that it was unmarshaled as.
+//
+// The receiver is left unchanged if the data cannot be unmarshaled.
 func (m *Macaroon) UnmarshalJSON(data []byte) error {
+	if len(data) == 0 {
+		return fmt.Errorf("empty JSON macaroon encoding")
+	}
 	if data[0] == '"' {
 		// It's a string, so it must be a base64-encoded binary form.
 		var s string
@@ -85,33 +90,50 @@ func (m *Macaroon) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &both); err != nil {
 		return err
 	}
+	// Unmarshal into a temporary macaroon so that the receiver
+	// is only ever updated when the entire unmarshal succeeds.
+	// This guarantees that no state can leak between successive
+	// unmarshals, even when the versions of the tokens differ.
+	var m1 Macaroon
 	switch {
 	case both.MacaroonJSONV1 != nil && both.MacaroonJSONV2 != nil:
 		return fmt.Errorf("cannot determine macaroon encoding version")
 	case both.MacaroonJSONV1 != nil:
-		if err := m.initJSONV1((*macaroonJSONV1)(both.MacaroonJSONV1)); err != nil {
+		if err := m1.initJSONV1((*macaroonJSONV1)(both.MacaroonJSONV1)); err != nil {
 			return err
 		}
-		m.version = V1
+		m1.version = V1
 	case both.MacaroonJSONV2 != nil:
-		if err := m.initJSONV2((*macaroonJSONV2)(both.MacaroonJSONV2)); err != nil {
+		if err := m1.initJSONV2((*macaroonJSONV2)(both.MacaroonJSONV2)); err != nil {
 			return err
 		}
-		m.version = V2
+		m1.version = V2
 	default:
 		return fmt.Errorf("invalid JSON macaroon encoding")
 	}
+	*m = m1
 	return nil
 }
 
 // UnmarshalBinary implements encoding.BinaryUnmarshaler.
 // It accepts both V1 and V2 binary encodings.
+//
+// The receiver is left unchanged if the data cannot be unmarshaled.
 func (m *Macaroon) UnmarshalBinary(data []byte) error {
 	// Copy the data to avoid retaining references to it
 	// in the internal data structures.
 	data = append([]byte(nil), data...)
-	_, err := m.parseBinary(data)
-	return err
+	// Parse into a temporary macaroon so that the receiver is
+	// only ever updated when the entire parse succeeds. This
+	// guarantees that the version, the caveat chain and the
+	// signature are always taken from the token itself, never
+	// mixed with state left over from a previous token.
+	var m1 Macaroon
+	if _, err := m1.parseBinary(data); err != nil {
+		return err
+	}
+	*m = m1
+	return nil
 }
 
 // parseBinary parses the macaroon in binary format
@@ -186,20 +208,25 @@ func (s Slice) MarshalBinary() ([]byte, error) {
 // UnmarshalBinary implements encoding.BinaryUnmarshaler.
 // It accepts all known binary encodings for the data - all the
 // embedded macaroons need not be encoded in the same format.
+//
+// The receiver is left unchanged if the data cannot be unmarshaled.
 func (s *Slice) UnmarshalBinary(data []byte) error {
 	// Prevent the internal data structures from holding onto the
 	// slice by copying it first.
 	data = append([]byte(nil), data...)
-	*s = (*s)[:0]
+	// Unmarshal into a temporary slice so that the receiver is
+	// left unchanged when the data is invalid.
+	var ms Slice
 	for len(data) > 0 {
 		var m Macaroon
 		rest, err := m.parseBinary(data)
 		if err != nil {
 			return fmt.Errorf("cannot unmarshal macaroon: %v", err)
 		}
-		*s = append(*s, &m)
+		ms = append(ms, &m)
 		data = rest
 	}
+	*s = ms
 	return nil
 }
 

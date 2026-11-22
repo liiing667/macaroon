@@ -1,7 +1,9 @@
 package macaroon_test
 
 import (
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"testing"
 
 	qt "github.com/frankban/quicktest"
@@ -238,5 +240,201 @@ func TestBase64Decode(t *testing.T) {
 			c.Assert(err, qt.Equals, nil)
 			c.Assert(string(out), qt.Equals, test.expect)
 		}
+	}
+}
+
+// makeMigrationTestMacaroons returns two macaroons with different
+// root keys, identifiers, locations, caveat chains and versions.
+func makeMigrationTestMacaroons(c *qt.C, vers1, vers2 macaroon.Version) (m1, m2 *macaroon.Macaroon) {
+	m1 = MustNew([]byte("root key one"), []byte("id one"), "location one", vers1)
+	c.Assert(m1.AddFirstPartyCaveat([]byte("caveat one")), qt.IsNil)
+	c.Assert(m1.AddFirstPartyCaveat([]byte("caveat two")), qt.IsNil)
+	m2 = MustNew([]byte("root key two"), []byte("id two"), "location two", vers2)
+	c.Assert(m2.AddFirstPartyCaveat([]byte("another caveat")), qt.IsNil)
+	return m1, m2
+}
+
+func TestUnmarshalBinaryReplacesPreviousState(t *testing.T) {
+	c := qt.New(t)
+	for _, vers1 := range jsonTestVersions {
+		for _, vers2 := range jsonTestVersions {
+			c.Run(fmt.Sprintf("%v_to_%v", vers1, vers2), func(c *qt.C) {
+				m1, m2 := makeMigrationTestMacaroons(c, vers1, vers2)
+				data1, err := m1.MarshalBinary()
+				c.Assert(err, qt.IsNil)
+				data2, err := m2.MarshalBinary()
+				c.Assert(err, qt.IsNil)
+
+				// Unmarshal the first token, then migrate the same
+				// macaroon value to the second token.
+				var m macaroon.Macaroon
+				c.Assert(m.UnmarshalBinary(data1), qt.IsNil)
+				c.Assert(m.UnmarshalBinary(data2), qt.IsNil)
+
+				// The result must be exactly the same as unmarshaling
+				// the second token into a fresh macaroon - the version,
+				// the caveat chain and the signature must be frozen from
+				// the second token, with nothing carried over from the first.
+				var fresh macaroon.Macaroon
+				c.Assert(fresh.UnmarshalBinary(data2), qt.IsNil)
+				c.Assert(m.Version(), qt.Equals, vers2)
+				c.Assert(m.Caveats(), qt.HasLen, 1)
+				c.Assert(m.Signature(), qt.DeepEquals, fresh.Signature())
+				c.Assert(m.Equal(&fresh), qt.Equals, true)
+			})
+		}
+	}
+}
+
+func TestUnmarshalJSONReplacesPreviousState(t *testing.T) {
+	c := qt.New(t)
+	for _, vers1 := range jsonTestVersions {
+		for _, vers2 := range jsonTestVersions {
+			c.Run(fmt.Sprintf("%v_to_%v", vers1, vers2), func(c *qt.C) {
+				m1, m2 := makeMigrationTestMacaroons(c, vers1, vers2)
+				data1, err := m1.MarshalJSON()
+				c.Assert(err, qt.IsNil)
+				data2, err := m2.MarshalJSON()
+				c.Assert(err, qt.IsNil)
+
+				var m macaroon.Macaroon
+				c.Assert(m.UnmarshalJSON(data1), qt.IsNil)
+				c.Assert(m.UnmarshalJSON(data2), qt.IsNil)
+
+				var fresh macaroon.Macaroon
+				c.Assert(fresh.UnmarshalJSON(data2), qt.IsNil)
+				c.Assert(m.Version(), qt.Equals, vers2)
+				c.Assert(m.Caveats(), qt.HasLen, 1)
+				c.Assert(m.Signature(), qt.DeepEquals, fresh.Signature())
+				c.Assert(m.Equal(&fresh), qt.Equals, true)
+			})
+		}
+	}
+}
+
+func TestUnmarshalBinaryFailureLeavesMacaroonUnchanged(t *testing.T) {
+	c := qt.New(t)
+	for _, vers := range jsonTestVersions {
+		c.Run(fmt.Sprintf("%v", vers), func(c *qt.C) {
+			m := MustNew([]byte("root key"), []byte("some id"), "a location", vers)
+			c.Assert(m.AddFirstPartyCaveat([]byte("a caveat")), qt.IsNil)
+			data, err := m.MarshalBinary()
+			c.Assert(err, qt.IsNil)
+
+			var um macaroon.Macaroon
+			c.Assert(um.UnmarshalBinary(data), qt.IsNil)
+			before := um.Clone()
+
+			// A truncated token must fail to unmarshal and must
+			// not change the macaroon in any way.
+			c.Assert(um.UnmarshalBinary(data[:len(data)-5]), qt.Not(qt.IsNil))
+			c.Assert(um.Equal(before), qt.Equals, true)
+			c.Assert(um.Version(), qt.Equals, vers)
+
+			// A retry with valid data must still succeed and
+			// reproduce the original macaroon exactly.
+			c.Assert(um.UnmarshalBinary(data), qt.IsNil)
+			c.Assert(um.Equal(m), qt.Equals, true)
+		})
+	}
+}
+
+func TestUnmarshalJSONFailureLeavesMacaroonUnchanged(t *testing.T) {
+	c := qt.New(t)
+	for _, vers := range jsonTestVersions {
+		c.Run(fmt.Sprintf("%v", vers), func(c *qt.C) {
+			m := MustNew([]byte("root key"), []byte("some id"), "a location", vers)
+			c.Assert(m.AddFirstPartyCaveat([]byte("a caveat")), qt.IsNil)
+			data, err := m.MarshalJSON()
+			c.Assert(err, qt.IsNil)
+
+			var um macaroon.Macaroon
+			c.Assert(um.UnmarshalJSON(data), qt.IsNil)
+			before := um.Clone()
+
+			// A V2 token with an invalid signature.
+			err = um.UnmarshalJSON([]byte(`{"i": "hello", "s64": "0n2y/R8idg5MPa6BN+LY/B32wHQcGK7UuXJWv3jR9Q"}`))
+			c.Assert(err, qt.Not(qt.IsNil))
+			c.Assert(um.Equal(before), qt.Equals, true)
+
+			// A V1 token with an invalid signature.
+			err = um.UnmarshalJSON([]byte(`{"caveats": [], "location": "x", "identifier": "y", "signature": "zz"}`))
+			c.Assert(err, qt.Not(qt.IsNil))
+			c.Assert(um.Equal(before), qt.Equals, true)
+
+			// A base64-encoded truncated binary token.
+			binData, err := m.MarshalBinary()
+			c.Assert(err, qt.IsNil)
+			truncated := binData[:len(binData)-5]
+			err = um.UnmarshalJSON([]byte(`"` + base64.StdEncoding.EncodeToString(truncated) + `"`))
+			c.Assert(err, qt.Not(qt.IsNil))
+			c.Assert(um.Equal(before), qt.Equals, true)
+
+			// A retry with valid data must still succeed and
+			// reproduce the original macaroon exactly.
+			c.Assert(um.UnmarshalJSON(data), qt.IsNil)
+			c.Assert(um.Equal(m), qt.Equals, true)
+		})
+	}
+}
+
+func TestSliceUnmarshalBinaryFailureLeavesSliceUnchanged(t *testing.T) {
+	c := qt.New(t)
+	// Use different versions for the two macaroons - a slice may
+	// legitimately contain a mixture of encoding versions.
+	m1 := MustNew([]byte("root key"), []byte("id one"), "location one", macaroon.V2)
+	c.Assert(m1.AddFirstPartyCaveat([]byte("caveat one")), qt.IsNil)
+	m2 := MustNew([]byte("root key"), []byte("id two"), "location two", macaroon.V1)
+	c.Assert(m2.AddFirstPartyCaveat([]byte("caveat two")), qt.IsNil)
+	s := macaroon.Slice{m1, m2}
+	data, err := s.MarshalBinary()
+	c.Assert(err, qt.IsNil)
+
+	var us macaroon.Slice
+	c.Assert(us.UnmarshalBinary(data), qt.IsNil)
+	c.Assert(us, qt.HasLen, 2)
+
+	// Truncate the data so that the second macaroon cannot be
+	// parsed. The whole slice must be left unchanged.
+	c.Assert(us.UnmarshalBinary(data[:len(data)-5]), qt.Not(qt.IsNil))
+	c.Assert(us, qt.HasLen, 2)
+	c.Assert(us[0].Equal(m1), qt.Equals, true)
+	c.Assert(us[1].Equal(m2), qt.Equals, true)
+
+	// A retry with valid data must still succeed.
+	c.Assert(us.UnmarshalBinary(data), qt.IsNil)
+	c.Assert(us, qt.HasLen, 2)
+	c.Assert(us[0].Equal(m1), qt.Equals, true)
+	c.Assert(us[1].Equal(m2), qt.Equals, true)
+}
+
+func TestMarshalUnmarshalEmptyCaveats(t *testing.T) {
+	c := qt.New(t)
+	for _, vers := range jsonTestVersions {
+		c.Run(fmt.Sprintf("%v", vers), func(c *qt.C) {
+			m := MustNew([]byte("root key"), []byte("some id"), "a location", vers)
+			c.Assert(m.Caveats(), qt.HasLen, 0)
+
+			binData, err := m.MarshalBinary()
+			c.Assert(err, qt.IsNil)
+			var umb macaroon.Macaroon
+			c.Assert(umb.UnmarshalBinary(binData), qt.IsNil)
+			c.Assert(umb.Version(), qt.Equals, vers)
+			c.Assert(umb.Caveats(), qt.HasLen, 0)
+			c.Assert(umb.Equal(m), qt.Equals, true)
+
+			// The empty-caveat macaroon must round-trip exactly.
+			binData1, err := umb.MarshalBinary()
+			c.Assert(err, qt.IsNil)
+			c.Assert(binData1, qt.DeepEquals, binData)
+
+			jsonData, err := m.MarshalJSON()
+			c.Assert(err, qt.IsNil)
+			var umj macaroon.Macaroon
+			c.Assert(umj.UnmarshalJSON(jsonData), qt.IsNil)
+			c.Assert(umj.Version(), qt.Equals, vers)
+			c.Assert(umj.Caveats(), qt.HasLen, 0)
+			c.Assert(umj.Equal(m), qt.Equals, true)
+		})
 	}
 }
